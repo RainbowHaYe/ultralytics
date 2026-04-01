@@ -13,7 +13,7 @@ from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, probiou, wasserstein_nwd
 from .tal import bbox2dist
 
 
@@ -106,12 +106,44 @@ class DFLoss(nn.Module):
 
 
 class BboxLoss(nn.Module):
-    """Criterion class for computing training losses for bounding boxes."""
+    """Criterion class for computing training losses for bounding boxes.
 
-    def __init__(self, reg_max: int = 16):
-        """Initialize the BboxLoss module with regularization maximum and DFL settings."""
+    Supports optional NWD (Normalized Wasserstein Distance) loss blending for
+    small-object-friendly regression.  When ``nwd_alpha < 1.0`` a portion of
+    the IoU loss is replaced by a Wasserstein-based similarity loss:
+
+        loss_iou = alpha * IoU_loss + (1 - alpha) * NWD_loss
+
+    Also supports Wise-IoU (WIoU) v1 as an alternative to CIoU for the base
+    IoU metric, providing a dynamic focusing mechanism that reduces the harmful
+    gradient of low-quality anchor boxes.
+
+    References:
+        Wang et al., "A Normalized Gaussian Wasserstein Distance for Tiny
+        Object Detection", https://arxiv.org/abs/2110.13389
+        Tong et al., "Wise-IoU: Bounding Box Regression Loss with Dynamic
+        Focusing Mechanism", https://arxiv.org/abs/2301.10051
+    """
+
+    def __init__(self, reg_max: int = 16, nwd_alpha: float = 0.5, use_wiou: bool = False, use_shapeiou: bool = False):
+        """Initialize the BboxLoss module.
+
+        Args:
+            reg_max (int): DFL regularization maximum.
+            nwd_alpha (float): Blending weight in [0, 1].
+                1.0 = pure IoU (original behaviour).
+                0.0 = pure NWD.
+                Recommended starting point for small-part datasets: **0.5**.
+            use_wiou (bool): If True, use Wise-IoU v1 instead of CIoU as
+                the base IoU metric.
+            use_shapeiou (bool): If True, use Shape-IoU instead of CIoU as
+                the base IoU metric (shape and scale aware).
+        """
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.nwd_alpha = nwd_alpha
+        self.use_wiou = use_wiou
+        self.use_shapeiou = use_shapeiou
 
     def forward(
         self,
@@ -123,10 +155,26 @@ class BboxLoss(nn.Module):
         target_scores_sum: torch.Tensor,
         fg_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for bounding boxes."""
+        """Compute IoU (+ optional NWD) and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        iou = bbox_iou(
+            pred_bboxes[fg_mask],
+            target_bboxes[fg_mask],
+            xywh=False,
+            CIoU=not self.use_wiou and not self.use_shapeiou,
+            WIoU=self.use_wiou,
+            ShapeIoU=self.use_shapeiou,
+        )
+        loss_iou_base = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        # ---- NWD blending ------------------------------------------------
+        if self.nwd_alpha < 1.0:
+            nwd_sim = wasserstein_nwd(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+            loss_nwd = ((1.0 - nwd_sim) * weight).sum() / target_scores_sum
+            loss_iou = self.nwd_alpha * loss_iou_base + (1.0 - self.nwd_alpha) * loss_nwd
+        else:
+            loss_iou = loss_iou_base
+        # ------------------------------------------------------------------
 
         # DFL loss
         if self.dfl_loss:
@@ -211,7 +259,12 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(
+            m.reg_max,
+            nwd_alpha=getattr(h, 'nwd_alpha', 1.0),
+            use_wiou=getattr(h, 'use_wiou', False),
+            use_shapeiou=getattr(h, 'use_shapeiou', False),
+        ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -236,8 +289,6 @@ class v8DetectionLoss:
         if self.use_dfl:
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:

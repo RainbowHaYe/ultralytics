@@ -55,8 +55,25 @@ from ultralytics.nn.modules import (
     Index,
     LRPCHead,
     Pose,
+    BiFPNFuse,
+    CBAM,
+    C2f_CBAM,
+    C3Ghost_CBAM,
+    C3_GSC,
+    CoordAtt,
+    ECA,
+    GSConv,
+    GSCBottleneck,
+    SimC2f,
+    SPDLiteConv,
+    StarC2f,
+    StarC2f_CBAM,
+    WAFF,
+    RepBottleneck,
+    RepC2f,
     RepC3,
     RepConv,
+    SPDConv,
     RepNCSPELAN4,
     RepVGGDW,
     ResNetLayer,
@@ -1548,11 +1565,23 @@ def parse_model(d, ch, verbose=True):
             torch.nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            RepC2f,
             RepC3,
             PSA,
             SCDown,
             C2fCIB,
             A2C2f,
+            # Custom modules
+            SPDConv,
+            SPDLiteConv,
+            GSConv,
+            GSCBottleneck,
+            C3_GSC,
+            C2f_CBAM,
+            C3Ghost_CBAM,
+            SimC2f,
+            StarC2f,
+            StarC2f_CBAM,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1561,17 +1590,25 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
+            C2f_CBAM,
             C3k2,
             C2fAttn,
             C3,
             C3TR,
             C3Ghost,
             C3x,
+            RepC2f,
             RepC3,
             C2fPSA,
             C2fCIB,
             C2PSA,
             A2C2f,
+            # Custom modules
+            C3_GSC,
+            C3Ghost_CBAM,
+            SimC2f,
+            StarC2f,
+            StarC2f_CBAM,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1621,6 +1658,24 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
+        elif m is ECA:
+            c1 = ch[f]
+            c2 = c1
+            args = [c1]
+        elif m is CBAM:
+            c1 = ch[f]
+            c2 = c1
+            args = [c1]
+        elif m is CoordAtt:
+            c1 = ch[f]
+            c2 = c1
+            args = [c1]
+        elif m is WAFF:
+            c2 = sum(ch[x] for x in f)
+            args = [[ch[x] for x in f]]
+        elif m is BiFPNFuse:
+            c2 = sum(ch[x] for x in f)
+            args = [[ch[x] for x in f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(

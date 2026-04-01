@@ -186,6 +186,7 @@ CFG_FRACTION_KEYS = frozenset(
         "conf",
         "iou",
         "fraction",
+        "nwd_alpha",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -238,6 +239,8 @@ CFG_BOOL_KEYS = frozenset(
         "nms",
         "profile",
         "multi_scale",
+        "use_wiou",
+        "use_shapeiou",
     }
 )
 

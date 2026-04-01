@@ -84,6 +84,8 @@ def bbox_iou(
     GIoU: bool = False,
     DIoU: bool = False,
     CIoU: bool = False,
+    WIoU: bool = False,
+    ShapeIoU: bool = False,
     eps: float = 1e-7,
 ) -> torch.Tensor:
     """Calculate the Intersection over Union (IoU) between bounding boxes.
@@ -100,10 +102,18 @@ def bbox_iou(
         GIoU (bool, optional): If True, calculate Generalized IoU.
         DIoU (bool, optional): If True, calculate Distance IoU.
         CIoU (bool, optional): If True, calculate Complete IoU.
+        WIoU (bool, optional): If True, calculate Wise-IoU v1 (dynamic focusing mechanism).
+        ShapeIoU (bool, optional): If True, calculate Shape-IoU (shape and scale aware).
         eps (float, optional): A small value to avoid division by zero.
 
     Returns:
-        (torch.Tensor): IoU, GIoU, DIoU, or CIoU values depending on the specified flags.
+        (torch.Tensor): IoU, GIoU, DIoU, CIoU, WIoU, or ShapeIoU values depending on the specified flags.
+
+    References:
+        Wise-IoU: Tong et al., "Wise-IoU: Bounding Box Regression Loss with
+        Dynamic Focusing Mechanism", https://arxiv.org/abs/2301.10051
+        Shape-IoU: Zhang et al., "Shape-IoU: More Accurate Metric considering
+        Bounding Box Shape and Scale", https://arxiv.org/abs/2312.17663
     """
     # Get the coordinates of bounding boxes
     if xywh:  # transform from xywh to xyxy
@@ -127,10 +137,10 @@ def bbox_iou(
 
     # IoU
     iou = inter / union
-    if CIoU or DIoU or GIoU:
+    if CIoU or DIoU or GIoU or WIoU or ShapeIoU:
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
-        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
+        if CIoU or DIoU or WIoU or ShapeIoU:  # Distance or Complete or Wise or Shape IoU
             c2 = cw.pow(2) + ch.pow(2) + eps  # convex diagonal squared
             rho2 = (
                 (b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)
@@ -140,10 +150,82 @@ def bbox_iou(
                 with torch.no_grad():
                     alpha = v / (v - iou + (1 + eps))
                 return iou - (rho2 / c2 + v * alpha)  # CIoU
+            if WIoU:  # Wise-IoU v1 https://arxiv.org/abs/2301.10051
+                # Dynamic focusing: outlier boxes (far from target) get reduced gradient
+                rho2_x = (b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) / 4
+                rho2_y = (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2) / 4
+                wise_factor = torch.exp(rho2_x / (cw.pow(2) + eps) + rho2_y / (ch.pow(2) + eps))
+                return 1 - wise_factor * (1 - iou)  # WIoU v1
+            if ShapeIoU:  # Shape-IoU https://arxiv.org/abs/2312.17663
+                # Shape-aware penalty: penalizes width and height differences
+                # separately, capturing shape mismatch beyond aspect ratio.
+                ww = 2.0 * (w2 - w1).pow(2) / (cw.pow(2) + eps)
+                wh = 2.0 * (h2 - h1).pow(2) / (ch.pow(2) + eps)
+                shape_cost = (1.0 - torch.exp(-ww)) + (1.0 - torch.exp(-wh))
+                return iou - (rho2 / c2 + 0.5 * shape_cost)  # ShapeIoU
             return iou - rho2 / c2  # DIoU
         c_area = cw * ch + eps  # convex area
         return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
     return iou  # IoU
+
+
+def wasserstein_nwd(
+    box1: torch.Tensor,
+    box2: torch.Tensor,
+    xywh: bool = False,
+    constant: float = 12.8,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Compute Normalized Wasserstein Distance (NWD) similarity between bounding boxes.
+
+    Each axis-aligned bounding box is modelled as a 2-D Gaussian:
+        μ = center(x, y),  Σ = diag(w²/12, h²/12)   (uniform → Gaussian moment matching)
+
+    The 2nd-order Wasserstein distance between two Gaussians N(μ₁,Σ₁) and N(μ₂,Σ₂) is:
+        W₂² = ‖μ₁ − μ₂‖² + Tr(Σ₁ + Σ₂ − 2(Σ₁^½ Σ₂ Σ₁^½)^½)
+    For diagonal covariance matrices this simplifies to:
+        W₂² = (cx₁−cx₂)² + (cy₁−cy₂)² + (w₁/√12 − w₂/√12)² + (h₁/√12 − h₂/√12)²
+            = ‖μ₁−μ₂‖² + (1/12)[(w₁−w₂)² + (h₁−h₂)²]
+
+    Normalisation (NWD):
+        NWD = exp(−W₂ / C)
+    where C is a dataset-aware constant (default 12.8 ≈ 2% of 640 input size).
+
+    Args:
+        box1 (torch.Tensor): Predicted boxes, last dim = 4.
+        box2 (torch.Tensor): Target boxes, last dim = 4.
+        xywh (bool): If True, input format is (cx, cy, w, h); otherwise (x1, y1, x2, y2).
+        constant (float): Normalisation constant C.  Larger C → softer penalty.
+            Rule of thumb: C ≈ 0.02 × imgsz  (for imgsz=640, C ≈ 12.8).
+        eps (float): Numerical stability.
+
+    Returns:
+        (torch.Tensor): NWD similarity in (0, 1], same shape as the leading dims of the inputs.
+            1 means perfect overlap, 0 means infinitely far apart.
+
+    References:
+        Wang et al., "A Normalized Gaussian Wasserstein Distance for Tiny Object Detection",
+        https://arxiv.org/abs/2110.13389
+    """
+    if xywh:
+        cx1, cy1, w1, h1 = box1.chunk(4, -1)
+        cx2, cy2, w2, h2 = box2.chunk(4, -1)
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        cx1, cy1 = (b1_x1 + b1_x2) / 2, (b1_y1 + b1_y2) / 2
+        cx2, cy2 = (b2_x1 + b2_x2) / 2, (b2_y1 + b2_y2) / 2
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1
+
+    # Squared W2 distance (diagonal Σ closed-form)
+    center_dist2 = (cx1 - cx2).pow(2) + (cy1 - cy2).pow(2)
+    size_dist2 = ((w1 - w2).pow(2) + (h1 - h2).pow(2)) / 12.0
+    w2_dist = (center_dist2 + size_dist2 + eps).sqrt()
+
+    # Normalise → similarity ∈ (0, 1]
+    nwd = (-w2_dist / constant).exp()
+    return nwd
 
 
 def mask_iou(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:

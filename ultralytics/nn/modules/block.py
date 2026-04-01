@@ -46,6 +46,8 @@ __all__ = (
     "HGStem",
     "ImagePoolingAttn",
     "Proto",
+    "RepBottleneck",
+    "RepC2f",
     "RepC3",
     "RepNCSPELAN4",
     "RepVGGDW",
@@ -1945,3 +1947,58 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+class RepBottleneck(Bottleneck):
+    """Bottleneck with re-parameterizable 3×3 convolutions (RepConv).
+
+    During training each 3×3 Conv is replaced by a RepConv that maintains
+    parallel 3×3 + 1×1 + identity branches.  At deploy time, call
+    ``switch_to_deploy()`` (or the framework's ``fuse()`` path) to fold
+    everything into a single 3×3 conv for zero-overhead inference.
+    """
+
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
+    ):
+        """Initialize RepBottleneck.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            g (int): Groups for convolutions.
+            k (tuple): Kernel sizes for convolutions (both should be 3).
+            e (float): Expansion ratio.
+        """
+        super().__init__(c1, c2, shortcut, g, k, e)
+        c_ = int(c2 * e)  # hidden channels
+        # Replace standard Conv with RepConv for both 3×3 layers
+        self.cv1 = RepConv(c1, c_, k[0], s=1)
+        self.cv2 = RepConv(c_, c2, k[1], s=1, g=g)
+
+
+class RepC2f(C2f):
+    """C2f module with RepBottleneck for structural re-parameterization.
+
+    Drop-in replacement for C2f.  During training the Bottleneck blocks use
+    multi-branch RepConv layers; at deploy time they are fused to plain 3×3
+    convolutions so the inference graph is identical to the original C2f.
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+        """Initialize RepC2f.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of RepBottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        # Override the module list: use RepBottleneck instead of Bottleneck
+        self.m = nn.ModuleList(
+            RepBottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0) for _ in range(n)
+        )
